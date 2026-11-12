@@ -1,0 +1,22 @@
+name: Native build and private-bus tests (Arch)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install build dependencies in the disposable CI container
+        run: pacman -Syu --noconfirm --needed git cmake python clang lld wine qt6-base layer-shell-qt kidletime dbus libx11 libxext
+      - uses: actions/checkout@v4
+      - name: Build matching bridge components
+        run: |
+          ./build.sh
+          ./build-host.sh
+      - name: Isolated regression tests
+        run: |
+          ctest --test-dir build/cmake --output-on-failure
+          python3 scripts/audit-source.py
+      # No release publishing, credentials, game download or desktop restart.

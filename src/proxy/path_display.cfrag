@@ -1,0 +1,51 @@
+/* Display only: do not return Linux display strings to filesystem operations. */
+static size_t ll_path_input_off;
+static void (*ll_path_set_text)(void*,void*,void*);
+static void *(*ll_music_override_get)(void*);
+static void *ll_paths_image(HMODULE ga,const char *wanted) {
+    fn_v domain=(void*)GetProcAddress(ga,"il2cpp_domain_get");
+    fn_asm assemblies=(void*)GetProcAddress(ga,"il2cpp_domain_get_assemblies");
+    fn_p image=(void*)GetProcAddress(ga,"il2cpp_assembly_get_image");
+    fn_name name=(void*)GetProcAddress(ga,"il2cpp_image_get_name");
+    if(!domain||!assemblies||!image||!name)return NULL;
+    size_t n=0;void **a=assemblies(domain(),&n);
+    for(size_t i=0;i<n;i++){void *im=image(a[i]);if(!lstrcmpA(name(im),wanted))return im;}
+    return NULL;
+}
+static void ll_linux_path_label(void *self,void *folder,void *method) {
+    (void)method;if(!self || !ll_path_input_off || !ll_path_set_text)return;
+    void *input=*(void**)((unsigned char*)self+ll_path_input_off);if(!input)return;
+    uint16_t source[LL_DESKTOP_PATH],native[LL_DESKTOP_PATH];
+    void *display=folder;
+    if(ll_managed_copy(source,LL_DESKTOP_PATH,folder) && source[0] && ll_desktop_to_unix(native,source))
+        display=ll_managed_utf16(native,lstrlenW((const WCHAR*)native));
+    if(!display)display=ll_managed_utf16((const uint16_t*)L"",0);
+    ll_path_set_text(input,display,NULL);
+}
+static void ll_path_diagnostics(void) {
+    static int done;if(done || !ll_music_override_get || !ll_managed_chars)return;done=1;
+    void *path=ll_music_override_get(NULL);if(!path || !ll_managed_length(path))return;
+    uint16_t native[LL_DESKTOP_PATH];
+    DWORD attrs=GetFileAttributesW((const WCHAR*)ll_managed_chars(path));
+    int mapped=ll_desktop_to_unix(native,ll_managed_chars(path));
+    void *round=mapped?ll_desktop_to_managed(native):NULL;
+    int valid=round && GetFileAttributesW((const WCHAR*)ll_managed_chars(round))!=INVALID_FILE_ATTRIBUTES;
+    logf("path validation: saved music directory exists=%d Linux display conversion=%d Unicode roundtrip=%d",
+        attrs!=INVALID_FILE_ATTRIBUTES && (attrs&FILE_ATTRIBUTE_DIRECTORY),mapped,valid);
+}
+static void ll_install_path_display(HMODULE ga,void *img,void *coreImg,fn_cls cls,fn_meth meth) {
+    char env[8]={0};GetEnvironmentVariableA("LILITH_LINUX_DESKTOP",env,sizeof(env));
+    if(env[0]=='0' || !ll_managed_length || !ll_managed_chars || !ll_managed_utf16 || !ll_wine_unix || !ll_wine_dos)return;
+    void *tmp=ll_paths_image(ga,"Unity.TextMeshPro.dll");
+    if(!tmp)tmp=ll_paths_image(ga,"Unity.TextMeshPro");
+    void *view=cls(img,"","LilithFolderView");
+    void *(*field)(void*,const char*)=(void*)GetProcAddress(ga,"il2cpp_class_get_field_from_name");
+    size_t (*offset)(void*)=(void*)GetProcAddress(ga,"il2cpp_field_get_offset");
+    void *f=view && field?field(view,"_pathInput"):NULL;
+    if(f && offset)ll_path_input_off=offset(f);
+    if(tmp)ll_path_set_text=(void*)ll_method(cls,meth,tmp,"TMPro","TMP_InputField","SetTextWithoutNotify",1);
+    if(ll_path_input_off && ll_path_set_text)
+        ll_hook_method(cls,meth,img,"","LilithFolderView","SetPathText",1,(void*)ll_linux_path_label);
+    ll_music_override_get=(void*)ll_method(cls,meth,img,"","MusicLibrary","get_DirectoryOverride",0);
+    (void)coreImg;
+}

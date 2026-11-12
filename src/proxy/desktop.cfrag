@@ -1,0 +1,123 @@
+/* Desktop integration: async folder-picking workflow stays in the original managed code.
+ * Only PickCore is replaced; callbacks/coroutines/save semantics remain untouched. */
+static int (*ll_managed_length)(void*);
+static const uint16_t *(*ll_managed_chars)(void*);
+static void *(*ll_managed_utf16)(const uint16_t*,int);
+static char *(WINAPI *ll_wine_unix)(const WCHAR*);
+static WCHAR *(WINAPI *ll_wine_dos)(const char*);
+#include "native_paths.h"
+static ll_url_unescape_fn ll_unescape_url;
+static ll_desktop *ll_desktop_channel(void) {
+    return g_shm ? (ll_desktop*)((unsigned char*)g_shm+LL_DESKTOP_OFF):NULL;
+}
+static int ll_copy16(uint16_t *dst,unsigned cap,const uint16_t *src,int len) {
+    if(len<0 || (unsigned)len>=cap)return 0;
+    for(int i=0;i<len;i++)dst[i]=src[i];dst[len]=0;return 1;
+}
+static int ll_managed_copy(uint16_t *dst,unsigned cap,void *str) {
+    if(!str){dst[0]=0;return 1;}
+    return ll_copy16(dst,cap,ll_managed_chars(str),ll_managed_length(str));
+}
+static ll_desktop_request *ll_desktop_reserve(uint32_t kind,int detached) {
+    ll_desktop *d=ll_desktop_channel();
+    if(!d || d->magic!=LL_DESKTOP_MAGIC || !d->host_ready)return NULL;
+    for(int i=0;i<LL_DESKTOP_CAP;i++) {
+        ll_desktop_request *s=&d->requests[i];
+        if(InterlockedCompareExchange((LONG*)&s->state,1,0)!=0)continue;
+        s->id=(uint32_t)InterlockedIncrement((LONG*)&d->next_id);
+        s->kind=kind;s->detached=detached;s->status=2;
+        s->title[0]=s->value[0]=s->result[0]=0;return s;
+    }
+    logf("desktop: request queue full");return NULL;
+}
+static int ll_desktop_to_unix(uint16_t *dst,const uint16_t *src) {
+    if(!src || !src[0])return 0;
+    if(src[0]=='/')return ll_copy16(dst,LL_DESKTOP_PATH,src,lstrlenW((const WCHAR*)src));
+    char *path=ll_wine_unix((const WCHAR*)src);if(!path)return 0;
+    int n=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,path,-1,(WCHAR*)dst,LL_DESKTOP_PATH);
+    HeapFree(GetProcessHeap(),0,path);return n>0;
+}
+static void *ll_desktop_to_managed(const uint16_t *src) {
+    char utf8[LL_DESKTOP_PATH*4];
+    int n=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,(const WCHAR*)src,-1,utf8,sizeof(utf8),NULL,NULL);
+    if(!n)return NULL;
+    WCHAR *path=ll_wine_dos(utf8);if(!path)return NULL;
+    void *str=ll_managed_utf16((const uint16_t*)path,lstrlenW(path));
+    HeapFree(GetProcessHeap(),0,path);return str;
+}
+static unsigned char ll_desktop_pick(void *title,void *owner,void **out,void *method) {
+    (void)owner;(void)method;if(out)*out=NULL;
+    ll_desktop_request *s=ll_desktop_reserve(1,0);if(!s)return 0;
+    if(!ll_managed_copy(s->title,LL_DESKTOP_TITLE,title)) {
+        // A long title may be shortened; never truncate a path.
+        const uint16_t *text=ll_managed_chars(title);
+        ll_copy16(s->title,LL_DESKTOP_TITLE,text,LL_DESKTOP_TITLE-1);
+    }
+    logf("desktop: folder chooser requested id=%u",s->id);
+    MemoryBarrier();InterlockedExchange((LONG*)&s->state,2);
+    DWORD started=GetTickCount(),changed=started;uint32_t beat=g_shm->host_heartbeat;
+    for(;;) {
+        LONG state=InterlockedCompareExchange((LONG*)&s->state,0,0);
+        if(state==4) {
+            MemoryBarrier();void *path=s->status==0?ll_desktop_to_managed(s->result):NULL;
+            if(out && path)ll_write_barrier(NULL,out,path);
+            logf("desktop: folder chooser completed id=%u status=%u mapped=%d",s->id,s->status,path!=NULL);
+            InterlockedExchange((LONG*)&s->state,0);return path!=NULL;
+        }
+        DWORD now=GetTickCount();if(beat!=g_shm->host_heartbeat){beat=g_shm->host_heartbeat;changed=now;}
+        if(now-started>300000 || now-changed>3000) {
+            // Do not free a host-owned slot until its cancellation is acknowledged.
+            if(InterlockedCompareExchange((LONG*)&s->state,5,2)==2 ||
+               InterlockedCompareExchange((LONG*)&s->state,5,3)==3) {
+                logf("desktop: folder chooser cancelled after timeout/host loss id=%u",s->id);return 0;
+            }
+        }
+        Sleep(10);
+    }
+}
+static int ll_desktop_queue_open(void *target,int force_path) {
+    uint16_t input[LL_DESKTOP_PATH];if(!target || !ll_managed_copy(input,LL_DESKTOP_PATH,target) || !input[0])return 0;
+    if((input[0]=='f'||input[0]=='F') && (input[1]=='i'||input[1]=='I') &&
+       (input[2]=='l'||input[2]=='L') && (input[3]=='e'||input[3]=='E') && input[4]==':') {
+        WCHAR decoded[LL_DESKTOP_PATH];
+        if(!ll_file_uri_path((const WCHAR*)input,decoded,LL_DESKTOP_PATH,ll_unescape_url))return 0;
+        if(!ll_copy16(input,LL_DESKTOP_PATH,(const uint16_t*)decoded,lstrlenW(decoded)))return 0;
+        force_path=1;
+    }
+    int uri=!force_path && ((input[0]>='a'&&input[0]<='z')||(input[0]>='A'&&input[0]<='Z'));
+    unsigned colon=0;while(input[colon] && colon<32 && input[colon]!=':')colon++;
+    uri=uri && colon>1 && input[colon]==':'; // drive letters are local paths, never URI schemes
+    ll_desktop_request *s=ll_desktop_reserve(uri?3:2,1);if(!s)return 0;
+    int ok=uri?ll_copy16(s->value,LL_DESKTOP_PATH,input,lstrlenW((const WCHAR*)input)):ll_desktop_to_unix(s->value,input);
+    if(!ok){InterlockedExchange((LONG*)&s->state,0);logf("desktop: path conversion rejected");return 0;}
+    MemoryBarrier();InterlockedExchange((LONG*)&s->state,2);
+    logf("desktop: native open queued id=%u kind=%u",s->id,s->kind);return 1;
+}
+static void ll_desktop_open_folder(void *path,void *method) {(void)method;ll_desktop_queue_open(path,1);}
+static void ll_desktop_open_url(void *uri,void *method) {(void)method;ll_desktop_queue_open(uri,0);}
+static void *ll_desktop_shell(void *owner,void *verb,void *file,void *args,void *cwd,int show,void *method) {
+    (void)owner;(void)cwd;(void)show;(void)method;
+    const WCHAR *v=verb?(const WCHAR*)ll_managed_chars(verb):L"";
+    // Never forward runas, executable commands or arbitrary parameter strings to a Linux shell.
+    if((v[0] && lstrcmpiW(v,L"open") && lstrcmpiW(v,L"explore")) ||
+       (args && ll_managed_length(args)>0)) {logf("desktop: shell verb/parameters not supported");return (void*)31;}
+    return (void*)(uintptr_t)(ll_desktop_queue_open(file,0)?33:31);
+}
+static void ll_install_desktop(HMODULE ga,void *img,void *coreImg,fn_cls cls,fn_meth meth) {
+    char env[8]={0};GetEnvironmentVariableA("LILITH_LINUX_DESKTOP",env,sizeof(env));if(env[0]=='0')return;
+    ll_managed_length=(void*)GetProcAddress(ga,"il2cpp_string_length");
+    ll_managed_chars=(void*)GetProcAddress(ga,"il2cpp_string_chars");
+    ll_managed_utf16=(void*)GetProcAddress(ga,"il2cpp_string_new_utf16");
+    HMODULE k=GetModuleHandleA("kernel32.dll");
+    HMODULE shlwapi=LoadLibraryA("shlwapi.dll");ll_unescape_url=shlwapi?(void*)GetProcAddress(shlwapi,"UrlUnescapeW"):NULL;
+    ll_wine_unix=(void*)GetProcAddress(k,"wine_get_unix_file_name");ll_wine_dos=(void*)GetProcAddress(k,"wine_get_dos_file_name");
+    if(!ll_managed_length || !ll_managed_chars || !ll_managed_utf16 || !ll_wine_unix || !ll_wine_dos || !ll_write_barrier) {
+        logf("ERROR native desktop prerequisites missing unix=%p dos=%p",ll_wine_unix,ll_wine_dos);return;
+    }
+    ll_hook_method(cls,meth,img,"","FolderPickerWin","PickCore",3,(void*)ll_desktop_pick);
+    ll_hook_method(cls,meth,img,"","FolderWatchRunner","OpenFolder",1,(void*)ll_desktop_open_folder);
+    ll_hook_method(cls,meth,img,"","FileStashRunner","OpenPathInShell",1,(void*)ll_desktop_open_folder);
+    ll_hook_method(cls,meth,img,"","WindowsNativeAPI","ShellExecute",6,(void*)ll_desktop_shell);
+    if(coreImg)ll_hook_method(cls,meth,coreImg,"UnityEngine","Application","OpenURL",1,(void*)ll_desktop_open_url);
+    logf("native desktop integration installed; original folder callbacks retained");
+}

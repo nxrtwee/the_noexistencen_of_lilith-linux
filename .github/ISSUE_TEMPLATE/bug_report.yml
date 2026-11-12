@@ -1,0 +1,24 @@
+name: Bug report
+description: Report a reproducible bridge issue without game files or personal data.
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach game files, saves, extracted metadata, a Proton prefix or unredacted logs.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Bridge version, distro, desktop/session, Qt, Proton, Steam game build, display scale/count.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps, expected behavior and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Minimal redacted diagnostics
+      description: Include only relevant lines and whether the problem occurs with the bridge disabled.

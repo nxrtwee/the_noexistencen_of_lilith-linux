@@ -1,0 +1,212 @@
+/* Remaining KDE services. Managed gameplay/UI stays original; no global keyboard interception. */
+static int ll_native_enabled;static CRITICAL_SECTION ll_native_mutex;
+static ll_native_snapshot ll_native_cache;
+static void *ll_native_string_class,*ll_native_object_class,*ll_player_class;
+static void *(*ll_native_default_player)(void*);static void (*ll_native_opened)(unsigned char,void*);
+static unsigned char (*ll_native_enqueue)(void*,unsigned char,void*);
+typedef struct {float x,y;} ll_native_point;
+static unsigned char (*ll_native_hit)(ll_native_point,void*);
+static void (*ll_stash_tick)(void*),(*ll_stash_pasted)(void*,void*);
+static void *ll_file_update_method;static size_t ll_clip_flag_offset;
+static int ll_native_post(uint32_t,uint32_t,void*);
+static int ll_native_external_session;
+static unsigned char (*ll_music_local_playing)(void*),(*ll_music_local_paused)(void*);
+static void (*ll_music_stop_original)(void*),(*ll_music_panel_hide)(void*,void*),(*ll_music_panel_show)(void*,void*);
+static void *ll_music_panel_instance;
+static void (*ll_music_static_get)(void*,void*);
+static int ll_native_local_music(void){return (ll_music_local_playing && ll_music_local_playing(NULL)) || (ll_music_local_paused && ll_music_local_paused(NULL));}
+static void ll_native_hide_external_panel(void){
+    if(!ll_native_external_session || !ll_music_panel_instance || !ll_music_static_get)return;
+    void *panel=NULL;ll_music_static_get(ll_music_panel_instance,&panel);if(!panel)return;
+    if(ll_native_local_music()){ll_native_external_session=0;if(ll_music_panel_show)ll_music_panel_show(panel,NULL);return;}
+    // Preserve the original listening/session flag and menu routing. Only the
+    // empty local controller is temporarily hidden through its ORIGINAL method.
+    if(ll_music_panel_hide)ll_music_panel_hide(panel,NULL);
+}
+#include "music_stop_trampoline.h"
+static void ll_native_music_stop(void *method){
+    int external=ll_native_external_session && !ll_native_local_music();
+    if(ll_music_stop_original)ll_music_stop_original(method);
+    if(external){ll_native_post(6,0,ll_native_default_player?ll_native_default_player(NULL):NULL);ll_native_external_session=0;logf("native external music stop: targeted Pause queued");}
+}
+static void ll_native_validate(void);
+static ll_native *ll_native_channel(void){return g_shm?(ll_native*)((unsigned char*)g_shm+LL_NATIVE_OFF):NULL;}
+static int ll_native_read(void){
+    ll_native *n=ll_native_channel();if(!n || n->magic!=LL_NATIVE_MAGIC)return 0;
+    EnterCriticalSection(&ll_native_mutex);uint32_t a=n->seq;MemoryBarrier();
+    if(a&1){LeaveCriticalSection(&ll_native_mutex);return 0;}
+    __builtin_memcpy(&ll_native_cache,&n->snapshot,sizeof(ll_native_cache));MemoryBarrier();
+    int ok=a==n->seq && ll_native_cache.ready;LeaveCriticalSection(&ll_native_mutex);return ok;
+}
+static int ll_native_post(uint32_t kind,uint32_t value,void *target){
+    ll_native *n=ll_native_channel();if(!n || n->magic!=LL_NATIVE_MAGIC)return 0;
+    for(int i=0;i<8;i++){ll_native_command *c=&n->commands[i];if(InterlockedCompareExchange((LONG*)&c->state,1,0)!=0)continue;
+        c->kind=kind;c->value=value;ll_tray_text(c->target,LL_NATIVE_TEXT,target);MemoryBarrier();InterlockedExchange((LONG*)&c->state,2);return 1;}
+    logf("native services: command queue full");return 0;
+}
+static unsigned char ll_native_startup_get(void *self,void *m){(void)self;(void)m;return ll_native_read() && ll_native_cache.autostart;}
+static void ll_native_startup_set(void *self,unsigned char enabled,void *m){(void)self;(void)m;ll_native_post(1,enabled,NULL);}
+static unsigned char ll_native_startup_static_get(void *m){return ll_native_startup_get(NULL,m);}
+static void ll_native_startup_static_set(unsigned char enabled,void *m){ll_native_startup_set(NULL,enabled,m);}
+static void *ll_native_process(void *self,void *m){(void)self;(void)m;return ll_native_read() && ll_native_cache.context_ready?ll_managed_utf16(ll_native_cache.process,lstrlenW((WCHAR*)ll_native_cache.process)):ll_string_new("");}
+static void *ll_native_app(void *self,void *m){(void)self;(void)m;return ll_native_read() && ll_native_cache.context_ready?ll_managed_utf16(ll_native_cache.app,lstrlenW((WCHAR*)ll_native_cache.app)):ll_string_new("");}
+static unsigned char ll_native_fullscreen(void *self,void *m){(void)self;(void)m;return ll_native_read() && ll_native_cache.context_ready && ll_native_cache.fullscreen;}
+static unsigned char ll_native_fullscreen_static(void *m){return ll_native_fullscreen(NULL,m);}
+static unsigned char ll_native_idle(void *self,int64_t *ticks,void *m){(void)self;(void)m;if(ticks)*ticks=0;if(!ticks || !ll_native_read() || !ll_native_cache.idle_valid)return 0;*ticks=(int64_t)ll_native_cache.idle_ms*10000;return 1;}
+static void ll_native_noop(void *m){(void)m;}
+static void ll_native_paste_enable(unsigned char enabled,void *m){(void)m;ll_native *n=ll_native_channel();if(n)n->paste_enabled=enabled;}
+static void ll_native_paste_over(unsigned char over,void *m){(void)m;ll_native *n=ll_native_channel();if(n)n->paste_over=over;}
+static unsigned char ll_native_paste_installed(void *m){(void)m;ll_native *n=ll_native_channel();return n && n->paste_enabled;}
+static void ll_native_paste_uninstall(void *m){ll_native_paste_enable(0,m);}
+static unsigned char ll_native_paste_consume(void *m){(void)m;static uint32_t seen;ll_native *n=ll_native_channel();if(!n)return 0;uint32_t now=n->paste_fired;int fired=now!=seen;seen=now;return fired && n->paste_enabled && n->paste_over;}
+static unsigned char ll_native_clip_has(void *m){(void)m;ll_native *n=ll_native_channel();return n && n->clipboard_has_files;}
+static void *ll_native_file_array(ll_native_files *batch){
+    if(!batch->count || batch->count>LL_NATIVE_FILE_COUNT || !batch->units || batch->units>LL_NATIVE_FILE_UNITS)return NULL;
+    for(uint32_t i=0;i<batch->count;i++){uint32_t p=batch->offsets[i],end=p;if(p>=batch->units)return NULL;while(end<batch->units && batch->paths[end])end++;if(end==batch->units || end-p>=4096 || batch->paths[p]!='/')return NULL;}
+    void *array=ll_array_new(ll_native_string_class,batch->count);if(!array)return NULL;uint32_t root=ll_gc_new(array,0);
+    for(uint32_t i=0;i<batch->count;i++){void *path=ll_desktop_to_managed(batch->paths+batch->offsets[i]);if(!path){ll_gc_free(root);return NULL;}array=ll_gc_target(root);void **items=(void**)((unsigned char*)array+4*sizeof(void*));ll_write_barrier(array,&items[i],path);}
+    array=ll_gc_target(root);ll_gc_free(root);return array;
+}
+static unsigned char ll_native_clip_read(void **paths,unsigned char *cut,void *m){
+    (void)m;if(paths)*paths=NULL;if(cut)*cut=0;ll_native *n=ll_native_channel();if(!n || !paths || !cut)return 0;
+    ll_native_files *b=&n->clipboard;
+    if(InterlockedCompareExchange((LONG*)&b->state,0,4)==4){} // discard a timed-out prior reply
+    if(InterlockedCompareExchange((LONG*)&b->state,1,0)!=0)return 0;
+    DWORD start=GetTickCount();while(GetTickCount()-start<1500){if(InterlockedCompareExchange((LONG*)&b->state,0,0)==4){MemoryBarrier();void *array=ll_native_file_array(b);*cut=b->cut!=0;if(array)ll_write_barrier(NULL,paths,array);InterlockedExchange((LONG*)&b->state,0);return array!=NULL;}Sleep(5);}
+    InterlockedCompareExchange((LONG*)&b->state,0,1);return 0;
+}
+static unsigned char ll_native_clip_clear(void *m){(void)m;ll_native *n=ll_native_channel();if(!n || !n->clipboard_token)return 0;n->clipboard_clear=n->clipboard_token;return 1;}
+static void ll_native_pump(int host_ok){
+    if(!ll_native_enabled || !host_ok)return;ll_native *n=ll_native_channel();if(!n || n->magic!=LL_NATIVE_MAGIC)return;
+    uint32_t probe=n->drop_probe_seq;MemoryBarrier();
+    if(probe!=n->drop_probe_reply){ll_native_point point={(float)(n->drop_probe_x-g_lastPos.x),(float)(g_lastSize.cy-(n->drop_probe_y-g_lastPos.y))};n->drop_probe_hit=ll_native_hit && ll_native_hit(point,NULL);MemoryBarrier();n->drop_probe_reply=probe;}
+    ll_native_hide_external_panel();
+    ll_native_validate();
+    static uint32_t resume=0;if(resume!=n->resume_serial){resume=n->resume_serial;logf("native services resumed; input state reset");}
+    for(int i=0;i<2;i++){ll_native_files *b=&n->drops[i];if(InterlockedCompareExchange((LONG*)&b->state,3,2)!=2)continue;
+        ll_native_point point={(float)(b->x-g_lastPos.x),(float)(g_lastSize.cy-(b->y-g_lastPos.y))};
+        if(ll_native_hit && ll_native_enqueue && ll_native_hit(point,NULL)){void *array=ll_native_file_array(b);if(array){unsigned char accepted=ll_native_enqueue(array,b->copy!=0,NULL);logf("native file drop accepted=%d count=%u copy=%u",accepted,b->count,b->copy);}}
+        InterlockedExchange((LONG*)&b->state,0);
+    }
+}
+static void ll_native_stash_update(void *self,void *method){
+    (void)method;if(ll_stash_tick)ll_stash_tick(NULL);ll_native *n=ll_native_channel();if(!n || !self)return;
+    ll_native_point point={(float)(g_shm->mouse_x-g_lastPos.x),(float)(g_lastSize.cy-(g_shm->mouse_y-g_lastPos.y))};
+    n->paste_enabled=1;n->paste_over=ll_native_hit && !(g_shm->game_flags&LL_PASSTHROUGH) && ll_native_hit(point,NULL);
+    if(ll_clip_flag_offset)*(unsigned char*)((unsigned char*)self+ll_clip_flag_offset)=n->clipboard_has_files!=0;
+    if(ll_native_paste_consume(NULL) && ll_stash_pasted)ll_stash_pasted(self,NULL);
+}
+static void *ll_native_players(void *m){
+    (void)m;ll_native_read();uint32_t count=ll_native_cache.player_count;if(count>LL_NATIVE_PLAYERS)count=LL_NATIVE_PLAYERS;if(!count)count=1;
+    void *array=ll_array_new(ll_player_class,count);if(!array)return NULL;uint32_t root=ll_gc_new(array,0);
+    for(uint32_t i=0;i<count;i++){
+        uint16_t *id=ll_native_cache.players[i].id,*label=ll_native_cache.players[i].label;
+        void *mid=ll_native_cache.player_count?ll_managed_utf16(id,lstrlenW((WCHAR*)id)):ll_string_new("linux.default");uint32_t ir=ll_gc_new(mid,0);
+        void *name=ll_native_cache.player_count?ll_managed_utf16(label,lstrlenW((WCHAR*)label)):ll_string_new("Linux default player (MPRIS)");uint32_t nr=ll_gc_new(name,0);
+        array=ll_gc_target(root);void **value=(void**)((unsigned char*)array+4*sizeof(void*)+i*80);
+        ll_write_barrier(array,&value[0],ll_gc_target(ir));for(int j=1;j<=3;j++)ll_write_barrier(array,&value[j],ll_gc_target(nr));
+        ll_gc_free(ir);ll_gc_free(nr);
+    }
+    array=ll_gc_target(root);ll_gc_free(root);return array;
+}
+static void *ll_native_player_byid(void *result,void *id,void *m){
+    (void)m;void *array=ll_native_players(NULL);__builtin_memset(result,0,80);if(!array)return result;
+    uint32_t count=(uint32_t)ll_array_len(array),selected=0;void **data=(void**)((unsigned char*)array+4*sizeof(void*));
+    if(id)for(uint32_t i=0;i<count;i++)if(!lstrcmpW((WCHAR*)ll_managed_chars(id),(WCHAR*)ll_managed_chars(data[i*10])))selected=i;
+    __builtin_memcpy(result,data+selected*10,80);return result;
+}
+static void *ll_native_current_player(void *result,void *m){return ll_native_player_byid(result,ll_native_default_player?ll_native_default_player(NULL):NULL,m);}
+static unsigned char ll_native_player_supported(void *m){(void)m;return 1;}
+static unsigned char ll_native_player_open_out(unsigned char *running,void *m){
+    (void)m;ll_native_read();if(running)*running=ll_native_cache.player_count>0;
+    int ok=ll_native_post(2,0,ll_native_default_player?ll_native_default_player(NULL):NULL);
+    if(ok){ll_native_external_session=1;if(ll_native_opened)ll_native_opened(1,NULL);
+        ll_native_hide_external_panel();
+        logf("native external music open: local panel temporarily hidden; original listening/menu state retained");
+    }return ok;
+}
+static unsigned char ll_native_player_open(void *m){return ll_native_player_open_out(NULL,m);}
+static void ll_native_player_playpause(void *m){(void)m;ll_native_post(3,0,ll_native_default_player?ll_native_default_player(NULL):NULL);}
+static void ll_native_player_next(void *m){(void)m;ll_native_post(4,0,ll_native_default_player?ll_native_default_player(NULL):NULL);}
+static void ll_native_player_previous(void *m){(void)m;ll_native_post(5,0,ll_native_default_player?ll_native_default_player(NULL):NULL);}
+static void *ll_native_empty_playback(void *m){(void)m;void *array=ll_array_new(ll_native_object_class,0);return array?ll_tray_call(array,"GetEnumerator",0,NULL):NULL;}
+static void ll_native_validate(void){
+    static int done;static DWORD first;if(done)return;if(!first){first=GetTickCount();return;}if(GetTickCount()-first<5000 || !ll_native_read())return;done=1;
+    void *array=ll_native_players(NULL);uint32_t root=array?ll_gc_new(array,0):0;
+    unsigned char value[80];ll_native_current_player(value,NULL);void **fields=(void**)value;
+    void *enumerator=ll_native_empty_playback(NULL);uint32_t er=enumerator?ll_gc_new(enumerator,0):0;
+    void *next=enumerator?ll_tray_call(enumerator,"MoveNext",0,NULL):NULL;
+    logf("native parity validation: players=%u current_player=%d empty_coroutine=%d context=%u idle=%u autostart=%u",array?(unsigned)ll_array_len(array):0,fields[0]!=NULL && fields[3]!=NULL,next && !*(unsigned char*)ll_unbox(next),ll_native_cache.context_ready,ll_native_cache.idle_valid,ll_native_cache.autostart);
+    void *panel=NULL;if(ll_music_panel_instance && ll_music_static_get)ll_music_static_get(ll_music_panel_instance,&panel);
+    logf("native music control validation: original_stop=%d panel_instance=%d local_state_api=%d",ll_music_stop_original!=NULL,panel!=NULL,ll_music_local_playing!=NULL && ll_music_local_paused!=NULL);
+    if(root)ll_gc_free(root);if(er)ll_gc_free(er);
+}
+static void ll_install_native(HMODULE ga,void *img,void *core,fn_cls cls,fn_meth meth){
+    char env[8]={0};GetEnvironmentVariableA("LILITH_LINUX_NATIVE",env,sizeof(env));if(env[0]=='0')return;
+    if(!ll_gc_new || !ll_invoke || !ll_managed_utf16 || !ll_wine_dos || !ll_array_new){logf("ERROR native parity prerequisites missing");return;}
+    InitializeCriticalSection(&ll_native_mutex);
+    void *corlib=ll_paths_image(ga,"mscorlib.dll");if(!corlib)corlib=ll_paths_image(ga,"mscorlib");
+    ll_native_string_class=corlib?cls(corlib,"System","String"):NULL;ll_native_object_class=corlib?cls(corlib,"System","Object"):NULL;
+    void *(*returntype)(void*)=(void*)GetProcAddress(ga,"il2cpp_method_get_return_type");void *(*fromtype)(void*)=(void*)GetProcAddress(ga,"il2cpp_class_from_type");
+    void *player=cls(img,"","ExternalPlayerLauncher"),*players=player?meth(player,"get_Players",0):NULL;
+    if(players && returntype && fromtype)ll_player_class=ll_element(fromtype(returntype(players)));uint32_t align=0;
+    if(!ll_native_string_class || !ll_native_object_class || !ll_player_class || ll_value_size(ll_player_class,&align)!=80){logf("ERROR native managed type layouts unavailable");return;}
+    ll_native_default_player=(void*)ll_method(cls,meth,img,"","ExternalPlayerLauncher","get_DefaultPlayerId",0);
+    ll_native_opened=(void*)ll_method(cls,meth,img,"","ExternalPlayerLauncher","set_HasOpenedThisSession",1);
+    ll_music_local_playing=(void*)ll_method(cls,meth,img,"","AudioManager","get_IsUserMusicPlaying",0);
+    ll_music_local_paused=(void*)ll_method(cls,meth,img,"","AudioManager","get_IsUserMusicPaused",0);
+    ll_music_panel_hide=(void*)ll_method(cls,meth,img,"","MusicPlayerController","OnTempHide",0);
+    ll_music_panel_show=(void*)ll_method(cls,meth,img,"","MusicPlayerController","OnTempShow",0);
+    void *panel=cls(img,"","MusicPlayerController"),*panelParent=panel?ll_parent(panel):NULL;
+    ll_music_panel_instance=panelParent?ll_fields(panelParent,"s_instance"):NULL;
+    ll_music_static_get=(void*)GetProcAddress(ga,"il2cpp_field_static_get_value");
+    void *stop=ll_method(cls,meth,img,"","AudioManager","StopUserMusic",0);
+    ll_music_stop_original=ll_native_stop_trampoline(stop);
+    if(ll_music_stop_original && ll_music_local_playing && ll_music_local_paused && ll_music_panel_instance && ll_music_panel_hide && ll_music_panel_show && ll_music_static_get)ll_hook_method(cls,meth,img,"","AudioManager","StopUserMusic",0,(void*)ll_native_music_stop);
+    else logf("ERROR native music stop/panel preflight failed; original method retained");
+    ll_native_enqueue=(void*)ll_method(cls,meth,img,"","FileStashService","Enqueue",2);
+    ll_native_hit=(void*)ll_method(cls,meth,img,"","TransparentWindowNew","IsPointOnCharacter",1);
+    ll_hook_method(cls,meth,img,"","WindowsPlatformService","GetLaunchAtLoginEnabled",0,(void*)ll_native_startup_get);
+    ll_hook_method(cls,meth,img,"","WindowsPlatformService","SetLaunchAtLoginEnabled",1,(void*)ll_native_startup_set);
+    ll_hook_method(cls,meth,img,"","Win32Helper","GetStartup",0,(void*)ll_native_startup_static_get);
+    ll_hook_method(cls,meth,img,"","Win32Helper","SetStartup",1,(void*)ll_native_startup_static_set);
+    ll_hook_method(cls,meth,img,"","Win32Helper","RefreshStartupEntry",0,(void*)ll_native_noop);
+    ll_hook_method(cls,meth,img,"","WindowsPlatformService","GetForegroundProcessName",0,(void*)ll_native_process);
+    ll_hook_method(cls,meth,img,"","WindowsPlatformService","GetForegroundProcessDisplayName",0,(void*)ll_native_app);
+    ll_hook_method(cls,meth,img,"","WindowsPlatformService","IsForegroundWindowFullscreen",0,(void*)ll_native_fullscreen);
+    ll_hook_method(cls,meth,img,"","WindowsPlatformService","IsExclusiveFullscreenAppRunning",0,(void*)ll_native_fullscreen_static);
+    ll_hook_method(cls,meth,img,"","WindowsPlatformService","TryGetTimeSinceLastSystemInput",1,(void*)ll_native_idle);
+    // KWin's supported idle API is aggregate input. Keyboard-only idle is conservatively bounded by it.
+    ll_hook_method(cls,meth,img,"","WindowsPlatformService","TryGetTimeSinceLastKeyboardInput",1,(void*)ll_native_idle);
+    ll_stash_tick=(void*)ll_method(cls,meth,img,"","FileStashService","Tick",0);
+    ll_stash_pasted=(void*)ll_method(cls,meth,img,"","FileStashRunner","OnPasted",0);
+    void *runner=cls(img,"","FileStashRunner"),*flag=runner?ll_fields(runner,"_clipboardHasFiles"):NULL;
+    if(flag)ll_clip_flag_offset=ll_field_off(flag);
+    if(ll_stash_tick && ll_stash_pasted && ll_clip_flag_offset)ll_hook_method(cls,meth,img,"","FileStashRunner","Update",0,(void*)ll_native_stash_update);
+    ll_hook_method(cls,meth,img,"","ClipboardFiles","HasFileList",0,(void*)ll_native_clip_has);
+    ll_hook_method(cls,meth,img,"","ClipboardFiles","TryRead",2,(void*)ll_native_clip_read);
+    ll_hook_method(cls,meth,img,"","ClipboardFiles","TryClear",0,(void*)ll_native_clip_clear);
+    ll_hook_method(cls,meth,img,"","ClipboardPasteHook","SetEnabled",1,(void*)ll_native_paste_enable);
+    ll_hook_method(cls,meth,img,"","ClipboardPasteHook","SetOverCharacter",1,(void*)ll_native_paste_over);
+    ll_hook_method(cls,meth,img,"","ClipboardPasteHook","get_Installed",0,(void*)ll_native_paste_installed);
+    ll_hook_method(cls,meth,img,"","ClipboardPasteHook","ConsumePendingPasteRequest",0,(void*)ll_native_paste_consume);
+    ll_hook_method(cls,meth,img,"","ClipboardPasteHook","Uninstall",0,(void*)ll_native_paste_uninstall);
+    ll_hook_method(cls,meth,img,"","ClipboardPasteHook","Install",0,(void*)ll_native_noop);
+    ll_hook_method(cls,meth,img,"","FileDropReceiver","SyncHook",0,(void*)ll_native_noop);
+    ll_hook_method(cls,meth,img,"","FileDropReceiver","Tick",0,(void*)ll_native_noop);
+    ll_hook_method(cls,meth,img,"","FileDropReceiver","Uninstall",0,(void*)ll_native_noop);
+    void *fallback=ll_method(cls,meth,img,"","FileStashService","MoveViaFileApi",4);
+    if(fallback)ll_hook_method(cls,meth,img,"","FileStashService","MoveViaShell",4,fallback);
+    ll_hook_method(cls,meth,img,"","ExternalPlayerLauncher","get_IsSupported",0,(void*)ll_native_player_supported);
+    ll_hook_method(cls,meth,img,"","ExternalPlayerLauncher","BuildPlayers",0,(void*)ll_native_players);
+    ll_hook_method(cls,meth,img,"","ExternalPlayerLauncher","get_Players",0,(void*)ll_native_players);
+    ll_hook_method(cls,meth,img,"","ExternalPlayerLauncher","FindById",1,(void*)ll_native_player_byid);
+    ll_hook_method(cls,meth,img,"","ExternalPlayerLauncher","get_CurrentPlayer",0,(void*)ll_native_current_player);
+    ll_hook_method(cls,meth,img,"","ExternalPlayerLauncher","TryOpen",0,(void*)ll_native_player_open);
+    ll_hook_method(cls,meth,img,"","ExternalPlayerLauncher","TryOpen",1,(void*)ll_native_player_open_out);
+    ll_hook_method(cls,meth,img,"","ExternalPlayerLauncher","SendPlayPause",0,(void*)ll_native_player_playpause);
+    ll_hook_method(cls,meth,img,"","ExternalPlayerLauncher","SendNextTrack",0,(void*)ll_native_player_next);
+    ll_hook_method(cls,meth,img,"","ExternalPlayerLauncher","SendPrevTrack",0,(void*)ll_native_player_previous);
+    ll_hook_method(cls,meth,img,"","ExternalPlayerLauncher","EnsurePlaybackRoutine",0,(void*)ll_native_empty_playback);
+    ll_native_enabled=1;logf("native parity services installed; no global clipboard keyboard hook");(void)core;
+}

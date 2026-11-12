@@ -1,0 +1,24 @@
+name: Source and safety checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax, source/privacy audit and isolated installer tests
+        run: |
+          python3 -m compileall -q bridge_config.py install.py launch.py run-game.py scripts tests
+          python3 scripts/audit-source.py
+          python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: Pure C guards (no desktop, game or player needed)
+        run: |
+          mkdir -p build
+          for name in motion-guard rebound-guard transport-stress; do
+            cc -std=c11 -O2 -UNDEBUG -pthread "tests/$name.c" -o "build/$name"
+            "./build/$name"
+          done

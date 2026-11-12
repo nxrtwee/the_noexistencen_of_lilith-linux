@@ -1,0 +1,55 @@
+# Build outputs and distributable artifacts
+/build/
+/dist/
+/.cache/
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+*.a
+*.lib
+*.pdb
+*.dmp
+*.zip
+*.tar
+*.tar.gz
+*.tar.zst
+# Runtime, machine configuration, results and private investigation
+/logs/
+/_work/
+/backups/
+/config.json
+/installation.json
+*.log
+**/*-result.json
+**/*-live-result.json
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+# Never import the game, extracted metadata, saves, prefixes or Steam state
+/GameAssembly*/
+/Lilith_Data/
+/The NOexistenceN of Lilith/
+/dump/
+/pfx/
+/drive_c/
+*.reg
+*.acf
+*.vdf
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+*~
+# Credentials / signing material (keep outside this repository)
+*.pem
+*.key
+*.p12
+*.pfx
+.ssh/
+.aws/
+credentials.json
+service-account*.json
